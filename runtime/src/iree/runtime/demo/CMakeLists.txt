@@ -51,3 +51,15 @@ iree_native_test(
   SRC
     ::hello_world_terse
 )
+
+iree_bytecode_module(
+  NAME
+    simple_mul_module
+  SRC
+    "simple_mul.mlir"
+  C_IDENTIFIER
+    "iree_runtime_testdata_simple_mul_module"
+  FLAGS
+    "--iree-hal-target-backends=vmvx"
+  PUBLIC
+)
