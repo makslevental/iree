@@ -11,6 +11,8 @@ import argparse
 import concurrent.futures
 import enum
 import multiprocessing
+import sys
+import time
 import traceback
 from pathlib import Path
 import threading
@@ -68,33 +70,16 @@ class Entrypoint:
                 bep.deps.update(bep.files(results))
 
 
-class Scheduler:
-    """Holds resources related to scheduling."""
-
-    def __init__(self):
-        self.thread_pool_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=10, thread_name_prefix="shortfin.build"
-        )
-        self.process_pool_executor = concurrent.futures.ProcessPoolExecutor(
-            max_workers=10, mp_context=multiprocessing.get_context("spawn")
-        )
-
-    def shutdown(self):
-        self.thread_pool_executor.shutdown(cancel_futures=True)
-        self.process_pool_executor.shutdown(cancel_futures=True)
-
-
 class Executor:
     """Executor that all build contexts share."""
 
-    def __init__(self, output_dir: Path, scheduler: Scheduler | None = None):
+    def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.verbose_level = 5
         # Keyed by path
         self.all: dict[str, "BuildContext" | "BuildFile"] = {}
         self.entrypoints: list["BuildEntrypoint"] = []
         BuildContext("", self)
-        self.scheduler = Scheduler() if scheduler is None else scheduler
 
     def check_path_not_exists(self, path: str, for_entity):
         existing = self.all.get(path)
@@ -142,94 +127,26 @@ class Executor:
 
     def build(self, *initial_deps: "BuildDependency"):
         """Transitively builds the given deps."""
-        # Invert the dependency chain so that we know when something is ready.
-        in_flight: set["BuildDependency"] = set()
-        producer_graph: dict["BuildDependency", list["BuildDependency"]] = dict()
+        scheduler = Scheduler()
+        success = False
+        try:
+            for d in initial_deps:
+                scheduler.add_initial_dep(d)
+                scheduler.build()
+            success = True
+        except:
+            import traceback
 
-        def add_dep(
-            dep: "BuildDependency",
-            produces: "BuildDependency",
-            stack: set["BuildDependency"],
-        ):
-            if dep in stack:
-                raise RuntimeError(
-                    f"Circular dependency: '{dep}' depends on itself: {stack}"
-                )
-            plist = producer_graph.get(dep)
-            if plist is None:
-                plist = []
-                producer_graph[dep] = plist
-            plist.append(produces)
-            next_stack = set(stack)
-            next_stack.add(dep)
-            if not dep.deps:
-                # Terminal - depends on nothing.
-                in_flight.add(dep)
-            else:
-                # Intermediate dep.
-                for next_dep in dep.deps:
-                    add_dep(next_dep, dep, next_stack)
-
-        for entrypoint in initial_deps:
-            stack = set()
-            stack.add(entrypoint)
-            for dep in entrypoint.deps:
-                add_dep(dep, entrypoint, stack)
-
-        # Schedule initial actions.
-        for initial in in_flight:
-            self._schedule_action(initial)
-
-        def service():
-            completed_deps: set["BuildDependency"] = set()
-            try:
-                for completed_fut in concurrent.futures.as_completed(
-                    (d.future for d in in_flight), 0
-                ):
-                    completed_dep = completed_fut.result()
-                    self.write_status(f"Completed {completed_dep}")
-                    completed_deps.add(completed_dep)
-            except TimeoutError:
-                pass
-
-            # Purge done from in-flight list.
-            in_flight.difference_update(completed_deps)
-
-            # Schedule any available.
-            for completed_dep in completed_deps:
-                ready_list = producer_graph.get(completed_dep)
-                if ready_list is None:
-                    continue
-                del producer_graph[completed_dep]
-                for ready_dep in ready_list:
-                    self._schedule_action(ready_dep)
-                    in_flight.add(ready_dep)
-
-            # Do a blocking wait for at least one ready.
-            concurrent.futures.wait(
-                (d.future for d in in_flight),
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-
-        while producer_graph:
-            self.write_status(f"Servicing {len(producer_graph)} outstanding tasks")
-            service()
-
-    def _schedule_action(self, dep: "BuildDependency"):
-        if isinstance(dep, BuildAction):
-            # Schedule the action.
-            self.write_status(f"Scheduling action: {dep}")
-            if dep.future is None:
-
-                def invoke():
-                    dep.invoke()
-                    return dep
-
-                dep.future = self.scheduler.thread_pool_executor.submit(invoke)
-        else:
-            # Not schedulable. Just mark it as done.
-            dep.future = concurrent.futures.Future()
-            dep.future.set_result(dep)
+            # TODO: We want some way to report the failure prior to the
+            # scheduler shutting down so that we do not end up in a situation
+            # where errors get swallowed. But just doing a print and exit here
+            # is not a good way.
+            traceback.print_exc()
+            sys.exit(1)
+        finally:
+            if not success:
+                print("Waiting for background tasks to complete...")
+            scheduler.shutdown()
 
 
 class BuildDependency:
@@ -238,11 +155,37 @@ class BuildDependency:
     def __init__(
         self, *, executor: Executor, deps: set["BuildDependency"] | None = None
     ):
-        self.future: concurrent.futures.Future | None = None
         self.executor = executor
         self.deps: set[BuildDependency] = set()
         if deps:
             self.deps.update(deps)
+
+        # Scheduling state.
+        self.future: concurrent.futures.Future | None = None
+        self.start_time: float | None = None
+        self.finish_time: float | None = None
+
+    @property
+    def is_scheduled(self) -> bool:
+        return self.future is not None
+
+    @property
+    def execution_time(self) -> float:
+        if self.start_time is None:
+            return 0.0
+        if self.finish_time is None:
+            return time.time() - self.start_time
+        return self.finish_time - self.start_time
+
+    def start(self, future: concurrent.futures.Future):
+        assert not self.is_scheduled, f"Cannot start an already scheduled dep: {self}"
+        self.future = future
+        self.start_time = time.time()
+
+    def finish(self):
+        assert self.is_scheduled, "Cannot finish an unstarted dep"
+        self.finish_time = time.time()
+        self.future.set_result(self)
 
 
 class BuildFile(BuildDependency):
@@ -305,8 +248,7 @@ class BuildAction(BuildDependency, abc.ABC):
         return f"Action[{type(self).__name__}]('{self.desc}')"
 
     @abc.abstractmethod
-    def invoke(self):
-        ...
+    def invoke(self): ...
 
 
 class BuildContext(BuildDependency):
@@ -390,14 +332,135 @@ class BuildContext(BuildDependency):
         existing = stack.pop()
         assert existing is self, "Unbalanced BuildContext enter/exit"
 
-    def populate_arg_parser(self, parser: argparse.ArgumentParser):
-        ...
+    def populate_arg_parser(self, parser: argparse.ArgumentParser): ...
 
 
 class BuildEntrypoint(BuildContext):
     def __init__(self, path: str, executor: Executor, entrypoint: Entrypoint):
         super().__init__(path, executor)
         self.entrypoint = entrypoint
+
+
+class Scheduler:
+    """Holds resources related to scheduling."""
+
+    def __init__(self):
+        # Inverted producer-consumer graph nodes mapping a producer dep to
+        # all deps which directly depend on it and will be unblocked by it
+        # beins satisfied.
+        self.producer_graph: dict[BuildDependency, list[BuildDependency]] = {}
+
+        # Set of build dependencies that have been scheduled. These will all
+        # have a future set on them prior to adding to the set.
+        self.in_flight_deps: set[BuildDependency] = set()
+
+        self.thread_pool_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=10, thread_name_prefix="shortfin.build"
+        )
+        self.process_pool_executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=10, mp_context=multiprocessing.get_context("spawn")
+        )
+
+    def shutdown(self):
+        self.thread_pool_executor.shutdown(cancel_futures=True)
+        self.process_pool_executor.shutdown(cancel_futures=True)
+
+    def add_initial_dep(self, initial_dep: BuildDependency):
+        if initial_dep in self.producer_graph:
+            # Already in the graph.
+            return
+
+        # At this point nothing depends on this initial dep, so just note it
+        # as producing nothing.
+        self.producer_graph[initial_dep] = []
+
+        # Adds a dep requested by some top-level caller.
+        stack: set[BuildDependency] = set()
+        stack.add(initial_dep)
+        for producer_dep in initial_dep.deps:
+            self._add_dep(producer_dep, initial_dep, stack)
+
+    def _add_dep(
+        self,
+        producer_dep: BuildDependency,
+        consumer_dep: BuildDependency,
+        stack: set[BuildDependency],
+    ):
+        if producer_dep in stack:
+            raise RuntimeError(
+                f"Circular dependency: '{producer_dep}' depends on itself: {stack}"
+            )
+        plist = self.producer_graph.get(producer_dep)
+        if plist is None:
+            plist = []
+            self.producer_graph[producer_dep] = plist
+        plist.append(consumer_dep)
+        next_stack = set(stack)
+        next_stack.add(producer_dep)
+        if producer_dep.deps:
+            # Intermediate dep.
+            for next_dep in producer_dep.deps:
+                self._add_dep(next_dep, producer_dep, next_stack)
+
+    def build(self):
+        # Build all deps until the graph is satisfied.
+        # Schedule any deps that have no dependencies to start things off.
+        for eligible_dep in self.producer_graph.keys():
+            if len(eligible_dep.deps) == 0:
+                self._schedule_action(eligible_dep)
+                self.in_flight_deps.add(eligible_dep)
+
+        while self.producer_graph:
+            print(f"Servicing {len(self.producer_graph)} outstanding tasks")
+            self._service_graph()
+
+    def _service_graph(self):
+        completed_deps: set[BuildDependency] = set()
+        try:
+            for completed_fut in concurrent.futures.as_completed(
+                (d.future for d in self.in_flight_deps), 0
+            ):
+                completed_dep = completed_fut.result()
+                assert isinstance(completed_dep, BuildDependency)
+                print(f"Completed {completed_dep}")
+                completed_deps.add(completed_dep)
+        except TimeoutError:
+            pass
+
+        # Purge done from in-flight list.
+        self.in_flight_deps.difference_update(completed_deps)
+
+        # Schedule any available.
+        for completed_dep in completed_deps:
+            ready_list = self.producer_graph.get(completed_dep)
+            if ready_list is None:
+                continue
+            del self.producer_graph[completed_dep]
+            for ready_dep in ready_list:
+                self._schedule_action(ready_dep)
+                self.in_flight_deps.add(ready_dep)
+
+        # Do a blocking wait for at least one ready.
+        concurrent.futures.wait(
+            (d.future for d in self.in_flight_deps),
+            return_when=concurrent.futures.FIRST_COMPLETED,
+        )
+
+    def _schedule_action(self, dep: BuildDependency):
+        if dep.is_scheduled:
+            return
+        if isinstance(dep, BuildAction):
+
+            def invoke():
+                dep.invoke()
+                return dep
+
+            print(f"Scheduling action: {dep}")
+            dep.start(self.thread_pool_executor.submit(invoke))
+        else:
+            # Not schedulable. Just mark it as done.
+            dep.start(concurrent.futures.Future())
+            dep.finish()
 
 
 # Type aliases.

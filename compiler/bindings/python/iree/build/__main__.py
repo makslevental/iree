@@ -56,19 +56,7 @@ def command_build(mod: ModuleWrapper, args, rest_argv):
 
     # Build.
     # TODO: Should resolve them from arguments vs just building all.
-    success = False
-    try:
-        executor.build(*executor.entrypoints)
-        success = True
-    except:
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
-    finally:
-        if not success:
-            print("Waiting for background tasks to complete...")
-        executor.scheduler.shutdown()
+    executor.build(*executor.entrypoints)
 
 
 def parse_top_level_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
