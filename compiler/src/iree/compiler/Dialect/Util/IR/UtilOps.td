@@ -336,7 +336,9 @@ def OpGroupAddressOffsetArithmeticOps : OpDocGroup {
 let opDocGroup = OpGroupAddressOffsetArithmeticOps in {
 
 def Util_AlignOp : Util_PureOp<"align", [
-  SameOperandsAndResultType
+    SameOperandsAndResultType,
+    DeclareOpInterfaceMethods<InferIntRangeInterface, ["inferResultRanges"]>,
+    DeclareOpInterfaceMethods<InferIntDivisibilityOpInterface, ["inferResultRanges"]>
 ]> {
   let summary = "Aligns up to a power-of-two alignment if required";
   let description = [{

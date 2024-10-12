@@ -1102,6 +1102,35 @@ void printShapedFunctionSignature(OpAsmPrinter &p, Operation *op,
 namespace mlir::iree_compiler::IREE::Util {
 
 //===----------------------------------------------------------------------===//
+// util.align
+//===----------------------------------------------------------------------===//
+
+void AlignOp::inferResultRanges(ArrayRef<ConstantIntRanges> argRanges,
+                                SetIntRangeFn setResultRange) {
+  auto constantAlignment = argRanges[1].getConstantValue();
+  if (constantAlignment) {
+    // We can align the range directly.
+    // (value + (alignment - 1)) & ~(alignment - 1)
+    // https://en.wikipedia.org/wiki/Data_structure_alignment#Computing_padding
+    APInt umin = argRanges[0].umin();
+    APInt umax = argRanges[0].umax();
+    APInt one(constantAlignment->getBitWidth(), 1);
+    APInt alignmentM1 = *constantAlignment - one;
+    APInt alignmentM1Inv = ~alignmentM1;
+    auto align = [&](APInt value) -> APInt {
+      return (value + alignmentM1) & alignmentM1Inv;
+    };
+    setResultRange(getResult(),
+                   ConstantIntRanges::fromUnsigned(align(umin), align(umax)));
+  } else {
+    // TODO: Expand bounds to let it saturate to any alignment.
+  }
+}
+
+void AlignOp::inferResultDivisibility(ArrayRef<IntegerDivisibility> argDivs,
+                                      SetIntDivisibilityFn setResultDivs) {}
+
+//===----------------------------------------------------------------------===//
 // util.assume.int
 //===----------------------------------------------------------------------===//
 

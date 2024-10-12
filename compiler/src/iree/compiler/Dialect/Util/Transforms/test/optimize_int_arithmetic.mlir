@@ -247,6 +247,20 @@ util.func @index_cast_i64_to_index_addi(%arg0 : index, %arg1 : index) -> index {
 }
 
 // -----
+// Multi-use should not convert
+// CHECK-LABEL: @index_cast_i64_to_index_addi_multiuse
+util.func @index_cast_i64_to_index_addi_multiuse(%arg0 : index, %arg1 : index) -> index, i64 {
+  // CHECK: %[[ASSUME:.*]] = util.assume.int
+  %0 = util.assume.int %arg0<umin=10, umax=100> : index
+  // CHECK: arith.index_cast
+  // CHECK: arith.index_cast
+  %1 = arith.index_cast %0 : index to i64
+  %2 = arith.addi %1, %1 : i64
+  %3 = arith.index_cast %2 : i64 to index
+  util.return %3, %2 : index, i64
+}
+
+// -----
 // CHECK-LABEL: @index_cast_i64_to_index_ceildivsi
 util.func @index_cast_i64_to_index_ceildivsi(%arg0 : index, %arg1 : index) -> index {
   // CHECK: %[[ASSUME:.*]] = util.assume.int
